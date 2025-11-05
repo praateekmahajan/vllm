@@ -1,6 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # adapted from https://github.com/deepseek-ai/DeepSeek-OCR/blob/main/DeepSeek-OCR-master/DeepSeek-OCR-vllm/process/image_process.py
+"""
+DeepSeek-OCR processor for vLLM.
+
+This processor supports multiple operating modes that can be configured via
+mm_processor_kwargs:
+
+- Tiny: base_size=512, image_size=512, crop_mode=False
+- Small: base_size=640, image_size=640, crop_mode=False
+- Base: base_size=1024, image_size=1024, crop_mode=False
+- Large: base_size=1280, image_size=1280, crop_mode=False
+- Gundam (default): base_size=1024, image_size=640, crop_mode=True
+
+Example usage:
+    llm = LLM(
+        model="deepseek-ai/deepseek-ocr",
+        mm_processor_kwargs={
+            "base_size": 1024,
+            "image_size": 1024,
+            "crop_mode": False,
+        }
+    )
+"""
 import math
 
 import torch
@@ -8,6 +30,10 @@ import torchvision.transforms as T
 from PIL import Image, ImageOps
 from transformers import AutoProcessor, BatchFeature, LlamaTokenizerFast
 from transformers.processing_utils import ProcessorMixin
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # TODO(Isotr0py): change modes for variants
 # see: https://github.com/deepseek-ai/DeepSeek-OCR/blob/8cf003d38821fa1b19c73da3bd1b0dc262ea8136/DeepSeek-OCR-master/DeepSeek-OCR-vllm/config.py#L1-L6
@@ -139,12 +165,39 @@ class ImageTransform:
 
 
 class DeepseekOCRProcessor(ProcessorMixin):
+    """
+    DeepSeek-OCR processor for handling images with configurable modes.
+    
+    Args:
+        tokenizer: The tokenizer to use for text processing.
+        base_size: Base size for the global image view (default: 1024 for Gundam mode).
+        image_size: Size for cropped image tiles (default: 640 for Gundam mode).
+        crop_mode: Whether to enable dynamic cropping (default: True for Gundam mode).
+        min_crops: Minimum number of crops for tiling (default: 2).
+        max_crops: Maximum number of crops for tiling (default: 6).
+        patch_size: Size of vision transformer patches (default: 16).
+        downsample_ratio: Downsampling ratio for features (default: 4).
+        image_mean: Mean values for image normalization.
+        image_std: Standard deviation values for image normalization.
+        normalize: Whether to normalize images.
+        image_token: Token string representing images in prompts.
+        pad_token: Token string for padding.
+        add_special_token: Whether to add special tokens.
+        sft_format: Format for supervised fine-tuning.
+        mask_prompt: Whether to mask prompts.
+        ignore_id: ID to use for ignored tokens.
+    """
     tokenizer_class = ("LlamaTokenizer", "LlamaTokenizerFast")
     attributes = ["tokenizer"]
 
     def __init__(
         self,
         tokenizer: LlamaTokenizerFast,
+        base_size: int = BASE_SIZE,
+        image_size: int = IMAGE_SIZE,
+        crop_mode: bool = CROP_MODE,
+        min_crops: int = MIN_CROPS,
+        max_crops: int = MAX_CROPS,
         patch_size: int = 16,
         downsample_ratio: int = 4,
         image_mean: tuple[float, float, float] = (0.5, 0.5, 0.5),
@@ -158,13 +211,16 @@ class DeepseekOCRProcessor(ProcessorMixin):
         ignore_id: int = -100,
         **kwargs,
     ):
-        self.image_size = IMAGE_SIZE
-        self.base_size = BASE_SIZE
-        self.patch_size = 16
+        self.image_size = image_size
+        self.base_size = base_size
+        self.crop_mode = crop_mode
+        self.min_crops = min_crops
+        self.max_crops = max_crops
+        self.patch_size = patch_size
         self.image_mean = image_mean
         self.image_std = image_std
         self.normalize = normalize
-        self.downsample_ratio = 4
+        self.downsample_ratio = downsample_ratio
 
         self.image_transform = ImageTransform(
             mean=image_mean, std=image_std, normalize=normalize
@@ -219,7 +275,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         self,
         prompt: str,
         images: list[Image.Image],
-        crop_mode: bool = CROP_MODE,
+        crop_mode: bool | None = None,
     ):
         """
 
@@ -242,6 +298,10 @@ class DeepseekOCRProcessor(ProcessorMixin):
         )
 
         sft_format = prompt
+        
+        # Use instance crop_mode if not explicitly overridden
+        if crop_mode is None:
+            crop_mode = self.crop_mode
 
         (
             input_ids,
@@ -277,9 +337,13 @@ class DeepseekOCRProcessor(ProcessorMixin):
         *,
         prompt: str,
         images: list[Image.Image],
-        crop_mode: bool = CROP_MODE,
+        crop_mode: bool | None = None,
         **kwargs,
     ):
+        # Use instance crop_mode if not explicitly overridden
+        if crop_mode is None:
+            crop_mode = self.crop_mode
+            
         prepare = self.process_one(
             prompt=prompt,
             images=images,
@@ -309,19 +373,25 @@ class DeepseekOCRProcessor(ProcessorMixin):
         image_shapes = []
         num_image_tokens = []
         tokenized_str = []
-        for text_sep, image in zip(text_splits, images):
+        total_visual_tokens = 0
+        
+        for img_idx, (text_sep, image) in enumerate(zip(text_splits, images)):
             tokenized_sep = self.encode(text_sep, bos=False, eos=False)
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
 
+            orig_width, orig_height = image.size
             image_shapes.append(image.size)
 
             images_crop_raw = []
-            if image.size[0] <= 640 and image.size[1] <= 640:
+            if orig_width <= 640 and orig_height <= 640:
                 crop_ratio = [1, 1]
             elif cropping:
                 images_crop_raw, crop_ratio = dynamic_preprocess(
-                    image, image_size=IMAGE_SIZE
+                    image, 
+                    min_num=self.min_crops,
+                    max_num=self.max_crops,
+                    image_size=self.image_size
                 )
             else:
                 crop_ratio = [1, 1]
@@ -359,12 +429,29 @@ class DeepseekOCRProcessor(ProcessorMixin):
                 tokenized_image += local_row * (num_queries * num_height_tiles)
             tokenized_str += tokenized_image
             images_seq_mask += [True] * len(tokenized_image)
-            num_image_tokens.append(len(tokenized_image))
+            num_tokens = len(tokenized_image)
+            num_image_tokens.append(num_tokens)
+            total_visual_tokens += num_tokens
+            
+            # Log per-image token statistics
+            logger.info(
+                "Image %d: %dx%d -> %d visual tokens (crop_ratio: %dx%d, "
+                "base_size: %d, image_size: %d, crop_mode: %s)",
+                img_idx + 1, orig_width, orig_height, num_tokens,
+                num_width_tiles, num_height_tiles,
+                self.base_size, self.image_size, cropping
+            )
 
         """process the last text split"""
         tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
         tokenized_str += tokenized_sep
         images_seq_mask += [False] * len(tokenized_sep)
+        
+        # Log batch summary
+        logger.info(
+            "Batch processed: %d images -> %d total visual tokens",
+            len(images), total_visual_tokens
+        )
 
         """add the bos and eos tokens"""
         if bos:
