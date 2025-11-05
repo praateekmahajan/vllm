@@ -192,12 +192,12 @@ class DeepseekOCRProcessingInfo(BaseProcessingInfo):
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"image": None}
-    
+
     def _get_processor_config(self) -> dict[str, int | bool]:
         """Get processor configuration from mm_processor_kwargs or defaults."""
         mm_config = self.ctx.model_config.get_multimodal_config()
         mm_kwargs = mm_config.mm_processor_kwargs or {}
-        
+
         return {
             "base_size": mm_kwargs.get("base_size", BASE_SIZE),
             "image_size": mm_kwargs.get("image_size", IMAGE_SIZE),
@@ -224,11 +224,11 @@ class DeepseekOCRProcessingInfo(BaseProcessingInfo):
             else:
                 # find the closest aspect ratio to the target
                 crop_ratio = count_tiles(
-                    image_width, 
-                    image_height, 
+                    image_width,
+                    image_height,
                     min_num=min_crops,
                     max_num=max_crops,
-                    image_size=image_size
+                    image_size=image_size,
                 )
 
             num_width_tiles, num_height_tiles = crop_ratio
@@ -251,7 +251,7 @@ class DeepseekOCRProcessingInfo(BaseProcessingInfo):
         config = self._get_processor_config()
         image_size = config["image_size"]
         base_size = config["base_size"]
-        
+
         if image_size == 1024 and base_size == 1280:
             return ImageSize(width=1024 * 2, height=1024 * 2)
         return ImageSize(width=image_size * 2, height=image_size * 2)
@@ -336,7 +336,7 @@ class DeepseekOCRMultiModalProcessor(
 
         image_token_id = hf_processor.image_token_id
         assert isinstance(image_token_id, int)
-        
+
         # Get configuration from the processor instance
         base_size = hf_processor.base_size
         image_size = hf_processor.image_size
@@ -373,7 +373,7 @@ class DeepseekOCRMultiModalProcessor(
                 replacement=get_replacement_deepseek_vl2,
             )
         ]
-    
+
     def _calculate_num_tokens(
         self,
         image_width: int,
@@ -390,11 +390,11 @@ class DeepseekOCRMultiModalProcessor(
 
         if crop_mode and (image_width > 640 or image_height > 640):
             crop_ratio = count_tiles(
-                image_width, 
-                image_height, 
+                image_width,
+                image_height,
                 min_num=min_crops,
                 max_num=max_crops,
-                image_size=image_size
+                image_size=image_size,
             )
             num_width_tiles, num_height_tiles = crop_ratio
         else:
@@ -521,7 +521,7 @@ class DeepseekOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
         if pixel_values is not None:
             # Use actual tensor dimensions instead of hardcoded base_size
-            # to support different preprocessing modes (tiny, small, base, large, gundam)
+            # to support different preprocessing modes (tiny,small,base,large,gundam)
             actual_base_size = pixel_values.shape[2]  # Get actual size from tensor
             # For image_size, check if we have crops; if not, use base_size
             # images_crop can be [0, 3, image_size, image_size] when no cropping occurs
@@ -532,7 +532,7 @@ class DeepseekOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 actual_image_size = images_crop.shape[2]
             else:
                 actual_image_size = actual_base_size
-            
+
             return DeepseekOCRImagePixelInputs(
                 type="pixel_values",
                 data=pixel_values,
